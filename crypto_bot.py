@@ -25,7 +25,7 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 1. إعدادات التلجرام الخاصة بك
+# 1. إعدادات التلجرام الخاص بك
 # ==========================================
 TELEGRAM_TOKEN = "8264898059:AAGIiseY7WFsx3Q77GrNC9ZFT9qXlxUP6TU"
 CHAT_ID = "5088377890"
@@ -115,9 +115,10 @@ def analyze_symbol(symbol):
 
         # -------------------------------------------------------------
         # الشرط 4: الاختراق على إطار زمني أصغر (15M Breakout)
+        # (ملاحظة: تم تصحيح limit إلى 40 لتفادي خطأ القيمة المعدومة)
         # -------------------------------------------------------------
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=15)
-        if len(ohlcv_15m) < 5:
+        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=40)
+        if len(ohlcv_15m) < 25:
             return
 
         df_15m = pd.DataFrame(ohlcv_15m, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
