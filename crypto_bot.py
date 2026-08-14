@@ -1,13 +1,13 @@
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask
 import ccxt
 import pandas as pd
 import requests
-import time
-from datetime import datetime
-from threading import Thread
-from flask import Flask
 
 # ==========================================
-# 0. خادم ويب وهمي لإبقاء الخدمة مجانية على Render
+# 0. خادم ويب وهمي لإبقاء الخدمة تعمل على Render
 # ==========================================
 app = Flask('')
 
@@ -19,6 +19,7 @@ def run_web_server():
     app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
+    from threading import Thread
     t = Thread(target=run_web_server)
     t.daemon = True
     t.start()
@@ -38,9 +39,9 @@ def send_telegram_msg(message):
         "disable_web_page_preview": True
     }
     try:
-        requests.post(url, json=payload, timeout=30)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"خطأ في إرسال رسالة التلجرام: {e}")
+        print(f"❌ خطأ في إرسال رسالة التلجرام: {e}")
 
 # ==========================================
 # 2. الربط مع منصة MEXC وجلب كافة العملات
@@ -52,17 +53,18 @@ def get_all_mexc_pairs():
         tickers = exchange.fetch_tickers()
         all_usdt_pairs = []
         for symbol, ticker in tickers.items():
-            if symbol.endswith('/USDT') and '3L' not in symbol and '3S' not in symbol:
+            # استبعاد عملات الرافعة المالية ذات المخاطر والعملات المنخفضة الفوليوم
+            if symbol.endswith('/USDT') and not any(x in symbol for x in ['3L', '3S', '4L', '4S', '5L', '5S']):
                 quote_volume = ticker.get('quoteVolume', 0)
                 if quote_volume and quote_volume > 50000:
                     all_usdt_pairs.append(symbol)
         return all_usdt_pairs
     except Exception as e:
-        print(f"خطأ في جلب كافة عملات MEXC: {e}")
+        print(f"❌ خطأ في جلب كافة عملات MEXC: {e}")
         return []
 
 # ==========================================
-# 3. خوارزمية الفحص
+# 3. خوارزمية التحليل
 # ==========================================
 def analyze_symbol(symbol):
     try:
@@ -77,10 +79,12 @@ def analyze_symbol(symbol):
         prev_20 = df.iloc[-21:-1]
         older_candles = df.iloc[-50:-21]
 
+        # الشروط الخاصة باستراتيجيتك
         has_test_pump = any((older_candles['high'] - older_candles['open']) / older_candles['open'] >= 0.10)
         avg_accum_vol = prev_20['volume'].mean()
         is_low_volume = avg_accum_vol < df['vol_ma'].iloc[-2]
         resistance_level = prev_20['high'].max()
+        
         is_breakout = current['close'] > resistance_level
         is_volume_surge = current['volume'] > (df['vol_ma'].iloc[-1] * 2.5)
 
@@ -93,30 +97,31 @@ def analyze_symbol(symbol):
                 f"🪙 **العملة:** `{symbol}`\n"
                 f"💰 **سعر الاختراق:** `{current['close']}`\n"
                 f"📊 **مستوى المقاومة المكسور:** `{resistance_level:.4f}`\n"
-                f"🔥 **الفوليوم الحالي:** 2.5x أعلى من المتوسط\n\n"
+                f"🔥 **الفوليوم الحالي:** أعلى من المتوسط بـ 2.5x\n\n"
                 f"📈 [فتح التشارت على TradingView]({chart_url})\n"
                 f"⏱ **التوقيت:** {datetime.now().strftime('%H:%M:%S')}"
             )
             send_telegram_msg(msg)
-            print(f"✅ تم إرسال تنبيه لعملة MEXC: {symbol}")
-    except Exception as e:
+            print(f"✅ تم إرسال تنبيه: {symbol}")
+    except Exception:
         pass
 
 # ==========================================
-# 4. تشغيل البوت المستمر
+# 4. التشغيل الرئيسي بالفحص المتوازي (Fast Multi-threading)
 # ==========================================
 if __name__ == "__main__":
-    # تشغيل سيرفر الويب لمنع خمول السيرفر
     keep_alive()
     
-    send_telegram_msg("🤖 **تم تشغيل البوت بنجاح عبر Web Service!**\nيقوم البوت الآن بمراقبة جميع عملات منصة MEXC...")
-    print("البوت يعمل الآن على فحص كافة عملات MEXC...")
+    send_telegram_msg("🤖 **تم تشغيل البوت بنجاح!**\nيقوم البوت الآن بمراقبة جميع عملات MEXC بسرعة فائقة...")
+    print("البوت يعمل الآن...")
     
     while True:
         symbols = get_all_mexc_pairs()
-        print(f"جاري فحص جميع عملات المنصة ({len(symbols)} عملة)...")
-        for symbol in symbols:
-            analyze_symbol(symbol)
-            time.sleep(0.3)
+        print(f"⚡ جاري فحص {len(symbols)} عملة بالتوازي...")
+        
+        # فحص 10 عملات معاً لضمان إنهاء الفحص في ثوانٍ بدلاً من دقائق
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            executor.map(analyze_symbol, symbols)
+            
         print("اكتملت دورة الفحص. الانتظار 10 دقائق...")
         time.sleep(600)
