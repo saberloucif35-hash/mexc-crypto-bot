@@ -1,25 +1,25 @@
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
 from flask import Flask
 import ccxt
 import pandas as pd
 import requests
 
 # ==========================================
-# 0. خادم ويب وهمي لإبقاء الخدمة تعمل على Render
+# 0. خادم ويب وهمي لإبقاء الخدمة تعمل 24/7 (على Render)
 # ==========================================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running 24/7!"
+    return "🤖 Trading Bot is active and scanning MEXC 24/7!"
 
 def run_web_server():
     app.run(host='0.0.0.0', port=8080)
 
 def keep_alive():
-    from threading import Thread
     t = Thread(target=run_web_server)
     t.daemon = True
     t.start()
@@ -44,7 +44,7 @@ def send_telegram_msg(message):
         print(f"❌ خطأ في إرسال رسالة التلجرام: {e}")
 
 # ==========================================
-# 2. الربط مع منصة MEXC وجلب كافة العملات
+# 2. الربط مع منصة MEXC وجلب كافة عملات USDT
 # ==========================================
 exchange = ccxt.mexc({'enableRateLimit': True})
 
@@ -53,8 +53,8 @@ def get_all_mexc_pairs():
         tickers = exchange.fetch_tickers()
         all_usdt_pairs = []
         for symbol, ticker in tickers.items():
-            # استبعاد عملات الرافعة المالية ذات المخاطر والعملات المنخفضة الفوليوم
-            if symbol.endswith('/USDT') and not any(x in symbol for x in ['3L', '3S', '4L', '4S', '5L', '5S']):
+            # استبعاد عملات الرافعة المالية والعملات المنخفضة الفوليوم
+            if symbol.endswith('/USDT') and not any(x in symbol for x in ['3L', '3S', '4L', '4S', '5L', '5S', 'BULL', 'BEAR']):
                 quote_volume = ticker.get('quoteVolume', 0)
                 if quote_volume and quote_volume > 50000:
                     all_usdt_pairs.append(symbol)
@@ -64,64 +64,119 @@ def get_all_mexc_pairs():
         return []
 
 # ==========================================
-# 3. خوارزمية التحليل
+# 3. خوارزمية تطبيق الشروط الأربعة وحساب الأهداف
 # ==========================================
 def analyze_symbol(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
-        if len(ohlcv) < 60:
+        # جلب داتا فريم الـ 4 ساعات לרصد الـ Test Pump والتجميع
+        ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=70)
+        if len(ohlcv_4h) < 60:
             return
 
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        df['vol_ma'] = df['volume'].rolling(20).mean()
-        
-        current = df.iloc[-1]
-        prev_20 = df.iloc[-21:-1]
-        older_candles = df.iloc[-50:-21]
+        df_4h = pd.DataFrame(ohlcv_4h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df_4h['vol_ma'] = df_4h['volume'].rolling(20).mean()
 
-        # الشروط الخاصة باستراتيجيتك
-        has_test_pump = any((older_candles['high'] - older_candles['open']) / older_candles['open'] >= 0.10)
-        avg_accum_vol = prev_20['volume'].mean()
-        is_low_volume = avg_accum_vol < df['vol_ma'].iloc[-2]
-        resistance_level = prev_20['high'].max()
-        
-        is_breakout = current['close'] > resistance_level
-        is_volume_surge = current['volume'] > (df['vol_ma'].iloc[-1] * 2.5)
+        # -------------------------------------------------------------
+        # الشرط 1: الـ Test Pump (ارتفاع تجريبي >= 15% وفوليوم عالي)
+        # -------------------------------------------------------------
+        pump_window = df_4h.iloc[-60:-10]
+        pump_candidates = pump_window[
+            ((pump_window['high'] - pump_window['low']) / pump_window['low'] >= 0.15) &
+            (pump_window['volume'] > pump_window['vol_ma'] * 2.0)
+        ]
 
-        if has_test_pump and is_low_volume and is_breakout and is_volume_surge:
+        if pump_candidates.empty:
+            return  # لا يوجد Test Pump سابق
+
+        pump_idx = pump_candidates.index[-1]
+        pump_candle = df_4h.loc[pump_idx]
+
+        # -------------------------------------------------------------
+        # الشرط 2: مرحلة التجميع (Accumulation Zone)
+        # -------------------------------------------------------------
+        accum_df = df_4h.loc[pump_idx + 1 : df_4h.index[-2]]
+        
+        # اشتراط فترة تجميع لا تقل عن 5 شموع (20 ساعة)
+        if len(accum_df) < 5:
+            return
+
+        # -------------------------------------------------------------
+        # الشرط 3: الفوليوم منخفض جداً أثناء التجميع (Low Volume)
+        # -------------------------------------------------------------
+        avg_accum_vol = accum_df['volume'].mean()
+        is_low_volume = avg_accum_vol < (pump_candle['volume'] * 0.4)
+
+        if not is_low_volume:
+            return
+
+        # تحديد أسرار المستويات (المقاومة والدعم للتجميع)
+        resistance_level = accum_df['high'].max()
+        support_level = accum_df['low'].min()
+
+        # -------------------------------------------------------------
+        # الشرط 4: الاختراق على إطار زمني أصغر (15M Breakout)
+        # -------------------------------------------------------------
+        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=15)
+        if len(ohlcv_15m) < 5:
+            return
+
+        df_15m = pd.DataFrame(ohlcv_15m, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df_15m['vol_ma'] = df_15m['volume'].rolling(20).mean()
+        
+        current_15m = df_15m.iloc[-1]
+
+        # الشراء عند إغلاق شمعة 15 دقيقة أعلى المقاومة + ارتفاع في الفوليوم
+        is_breakout = current_15m['close'] > resistance_level
+        is_volume_surge = current_15m['volume'] > (df_15m['vol_ma'].iloc[-1] * 2.0)
+
+        if is_breakout and is_volume_surge:
+            entry_price = current_15m['close']
+            
+            # 📊 حساب الأهداف ووقف الخسارة تلقائياً:
+            stop_loss = support_level * 0.97         # أسفل قاع التجميع بـ 3%
+            tp1 = entry_price * 1.5                  # +50%
+            tp2 = entry_price * 3.0                  # +200%
+            tp3 = entry_price * 11.0                 # +1000%
+            tp4 = entry_price * 31.0                 # +3000%
+
             clean_symbol = symbol.replace('/', '')
             chart_url = f"https://www.tradingview.com/chart/?symbol=MEXC:{clean_symbol}"
             
             msg = (
-                f"🚨 **فرصة اختراق على منصة MEXC!**\n\n"
+                f"🚨 **توصية صفقة انفجارية (MEXC)!**\n\n"
                 f"🪙 **العملة:** `{symbol}`\n"
-                f"💰 **سعر الاختراق:** `{current['close']}`\n"
-                f"📊 **مستوى المقاومة المكسور:** `{resistance_level:.4f}`\n"
-                f"🔥 **الفوليوم الحالي:** أعلى من المتوسط بـ 2.5x\n\n"
+                f"🎯 **سعر الدخول:** `{entry_price:.6f}`\n"
+                f"🛑 **وقف الخسارة (SL):** `{stop_loss:.6f}`\n\n"
+                f"📌 **أهداف جني الأرباح (Take Profit):**\n"
+                f"1️⃣ **الهدف الأول (+50%):** `{tp1:.6f}`\n"
+                f"2️⃣ **الهدف الثاني (+200%):** `{tp2:.6f}`\n"
+                f"3️⃣ **هدف الانفجار (+1000%):** `{tp3:.6f}`\n"
+                f"4️⃣ **الهدف الأقصى (+3000%):** `{tp4:.6f}`\n\n"
+                f"⚠️ **تنبيه:** عند تحقق الهدف الأول (+50%)، انقل وقف الخسارة لسعر الدخول تلقائياً.\n\n"
                 f"📈 [فتح التشارت على TradingView]({chart_url})\n"
                 f"⏱ **التوقيت:** {datetime.now().strftime('%H:%M:%S')}"
             )
             send_telegram_msg(msg)
-            print(f"✅ تم إرسال تنبيه: {symbol}")
+            print(f"✅ تم إرسال توصية: {symbol}")
+
     except Exception:
         pass
 
 # ==========================================
-# 4. التشغيل الرئيسي بالفحص المتوازي (Fast Multi-threading)
+# 4. التشغيل الرئيسي بالفحص المتوازي
 # ==========================================
 if __name__ == "__main__":
     keep_alive()
     
-    send_telegram_msg("🤖 **تم تشغيل البوت بنجاح!**\nيقوم البوت الآن بمراقبة جميع عملات MEXC بسرعة فائقة...")
-    print("البوت يعمل الآن...")
+    send_telegram_msg("🤖 **تم تشغيل البوت المطور بنجاح!**\nيقوم البوت الآن بمراقبة جميع عملات MEXC وحساب الأهداف الانفجارية...")
+    print("البوت يعمل الآن ويراقب السوق...")
     
     while True:
         symbols = get_all_mexc_pairs()
         print(f"⚡ جاري فحص {len(symbols)} عملة بالتوازي...")
         
-        # فحص 10 عملات معاً لضمان إنهاء الفحص في ثوانٍ بدلاً من دقائق
         with ThreadPoolExecutor(max_workers=10) as executor:
             executor.map(analyze_symbol, symbols)
             
-        print("اكتملت دورة الفحص. الانتظار 10 دقائق...")
-        time.sleep(600)
+        print("اكتملت دورة الفحص. الانتظار 5 دقائق...")
+        time.sleep(300)
